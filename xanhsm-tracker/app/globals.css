@@ -1,0 +1,80 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+:root {
+  --bg:       #080e0a;
+  --bg-card:  #0d1610;
+  --bg-hover: #111d14;
+  --border:   #1e3325;
+  --border-hi:#2d5040;
+  --text:     #e8f5ec;
+  --text-muted: #6b9278;
+  --text-dim: #3d6650;
+  --xanh:     #00d478;
+  --xanh-dim: #004d2b;
+  --uber:     #06b6d4;    /* cyan  */
+  --ola:      #f59e0b;    /* amber */
+  --rapido:   #f43f5e;    /* rose  */
+  --surge:    #fb923c;
+}
+
+* { box-sizing: border-box; }
+
+body {
+  background: var(--bg);
+  color: var(--text);
+  font-family: var(--font-display), sans-serif;
+  -webkit-font-smoothing: antialiased;
+}
+
+/* Scrollbar */
+::-webkit-scrollbar { width: 4px; height: 4px; }
+::-webkit-scrollbar-track { background: var(--bg); }
+::-webkit-scrollbar-thumb { background: var(--border-hi); border-radius: 2px; }
+
+/* Card */
+.card {
+  background: var(--bg-card);
+  border: 1px solid var(--border);
+  border-radius: 12px;
+}
+.card:hover { border-color: var(--border-hi); }
+
+/* Platform chips */
+.chip-uber    { color: var(--uber);   background: #06b6d41a; border: 1px solid #06b6d433; }
+.chip-ola     { color: var(--ola);    background: #f59e0b1a; border: 1px solid #f59e0b33; }
+.chip-rapido  { color: var(--rapido); background: #f43f5e1a; border: 1px solid #f43f5e33; }
+.chip-xanh    { color: var(--xanh);  background: #00d4781a; border: 1px solid #00d47833; }
+
+/* Surge glow */
+.surge-glow { animation: surgeGlow 2s ease-in-out infinite; }
+@keyframes surgeGlow {
+  0%, 100% { box-shadow: 0 0 8px #fb923c44; }
+  50%       { box-shadow: 0 0 20px #fb923c88; }
+}
+
+/* Noise texture overlay */
+.noise::after {
+  content: '';
+  position: absolute;
+  inset: 0;
+  background-image: url("data:image/svg+xml,%3Csvg viewBox='0 0 256 256' xmlns='http://www.w3.org/2000/svg'%3E%3Cfilter id='noise'%3E%3CfeTurbulence type='fractalNoise' baseFrequency='0.9' numOctaves='4' stitchTiles='stitch'/%3E%3C/filter%3E%3Crect width='100%25' height='100%25' filter='url(%23noise)' opacity='0.04'/%3E%3C/svg%3E");
+  pointer-events: none;
+  border-radius: inherit;
+}
+
+/* Animated line */
+@keyframes scanline {
+  0%   { transform: translateX(-100%); }
+  100% { transform: translateX(400%); }
+}
+.scan-line::after {
+  content: '';
+  position: absolute;
+  top: 0; left: 0; right: 0; bottom: 0;
+  background: linear-gradient(90deg, transparent 0%, var(--xanh) 50%, transparent 100%);
+  opacity: 0.06;
+  animation: scanline 4s linear infinite;
+  pointer-events: none;
+}

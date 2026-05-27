@@ -1,0 +1,22 @@
+# Dependencies
+node_modules/
+__pycache__/
+*.pyc
+.venv/
+
+# Next.js
+.next/
+out/
+
+# Env files — NEVER commit these
+.env
+.env.local
+.env.*.local
+
+# Scraper data
+scraper/data/
+scraper/logs/*.png
+
+# OS
+.DS_Store
+Thumbs.db
