@@ -1,136 +1,196 @@
 """
-Uber Scraper
-────────────
-Uses Uber's web-based price estimator (uber.com/in/en/price-estimate/).
-This is the most scrapeable platform because Uber has a proper web UI.
+Uber Scraper — API approach
+────────────────────────────
+Calls Uber's internal price estimate API directly (no browser UI needed).
+Much more reliable than DOM scraping.
 
-Strategy:
-  1. Open price-estimate page
-  2. Type origin → pick first autocomplete suggestion
-  3. Type destination → pick first suggestion
-  4. Wait for fare cards to load
-  5. Extract service name, price range, ETA, surge indicator per card
+Uber exposes a public-ish REST endpoint used by their web price estimator:
+  GET https://www.uber.com/api/v1/marketplace/product-estimates
+  with start/end lat+lng as query params.
+
+Falls back to a full-page Playwright scrape if the API fails.
 """
 
 import asyncio
 import re
-from typing import List, Dict
+import httpx
+from typing import List, Dict, Optional
 
-from playwright.async_api import Page
+from playwright.async_api import Page, Response
 
 from scrapers.base import BaseScraper, build_record, detect_surge
 from config import SCRAPER
 
 
+# Uber product names we care about (maps internal name → display name)
+UBER_PRODUCTS = {
+    "ubergo":       "UberGo",
+    "ubermoto":     "Uber Moto",
+    "uberauto":     "Uber Auto",
+    "uberx":        "UberX",
+    "uberxl":       "UberXL",
+    "ubergo sedan": "UberGo Sedan",
+    "premier":      "Premier",
+    "comfort":      "Comfort",
+}
+
+
 class UberScraper(BaseScraper):
     platform_key = "uber"
     platform_name = "Uber"
-    BASE_URL = "https://www.uber.com/in/en/price-estimate/"
+
+    # Uber's price estimate API endpoint
+    ESTIMATE_URL = "https://www.uber.com/api/v1/marketplace/product-estimates"
+
+    # Fallback: price estimate page
+    WEB_URL = "https://www.uber.com/in/en/price-estimate/"
 
     async def scrape_od(self, page: Page, od: Dict, run_id: str) -> List[Dict]:
-        await page.goto(self.BASE_URL, wait_until="domcontentloaded")
-        await asyncio.sleep(SCRAPER["wait_after_load_s"])
+        # Try API approach first
+        records = await self._api_scrape(od, run_id)
+        if records:
+            self.logger.info("[Uber] API: %s → %d records", od["label"], len(records))
+            return records
 
-        # ── Fill Origin ──────────────────────────────────────────────────────
-        origin_input = page.locator('input[placeholder*="Pickup" i], input[name*="pickup" i], input[id*="pickup" i]').first
-        await origin_input.click()
-        await origin_input.fill(od["origin"]["address"])
-        await asyncio.sleep(1.5)
-        # Pick first dropdown suggestion
-        suggestion = page.locator('[class*="suggestion" i], [class*="result" i], [role="option"]').first
-        await suggestion.wait_for(state="visible", timeout=8000)
-        await suggestion.click()
-        await asyncio.sleep(1)
+        # Fallback: intercept network calls from the web page
+        self.logger.info("[Uber] API failed, trying network interception for %s", od["label"])
+        records = await self._intercept_scrape(page, od, run_id)
+        if records:
+            return records
 
-        # ── Fill Destination ─────────────────────────────────────────────────
-        dest_input = page.locator('input[placeholder*="Destination" i], input[placeholder*="dropoff" i], input[name*="destination" i]').first
-        await dest_input.click()
-        await dest_input.fill(od["destination"]["address"])
-        await asyncio.sleep(1.5)
-        suggestion2 = page.locator('[class*="suggestion" i], [class*="result" i], [role="option"]').first
-        await suggestion2.wait_for(state="visible", timeout=8000)
-        await suggestion2.click()
-        await asyncio.sleep(SCRAPER["wait_after_load_s"])
+        # Last resort: text parsing
+        self.logger.warning("[Uber] Both approaches failed for %s", od["label"])
+        return [build_record(
+            platform=self.platform_key, od=od, service_name="ALL",
+            price_raw=None, run_id=run_id, status="failed",
+            error_msg="Could not extract fares via API or interception",
+        )]
 
-        # ── Wait for fare cards ──────────────────────────────────────────────
-        # Uber renders a list of product cards after both inputs are filled
+    async def _api_scrape(self, od: Dict, run_id: str) -> List[Dict]:
+        """Call Uber's price estimate API directly."""
+        params = {
+            "start_latitude":  od["origin"]["lat"],
+            "start_longitude": od["origin"]["lng"],
+            "end_latitude":    od["destination"]["lat"],
+            "end_longitude":   od["destination"]["lng"],
+        }
+        headers = {
+            "User-Agent": "Mozilla/5.0 (Linux; Android 13; Pixel 7) AppleWebKit/537.36 Chrome/120.0.0.0 Mobile Safari/537.36",
+            "Accept": "application/json",
+            "Accept-Language": "en-IN,en;q=0.9",
+            "Referer": "https://www.uber.com/in/en/price-estimate/",
+            "x-csrf-token": "x",
+        }
+
         try:
-            await page.wait_for_selector('[class*="PriceEstimateCard" i], [class*="fare-card" i], [data-testid*="price" i]', timeout=15000)
-        except Exception:
-            # Fallback: just wait and try anyway
-            await asyncio.sleep(3)
+            async with httpx.AsyncClient(timeout=20, follow_redirects=True) as client:
+                resp = await client.get(self.ESTIMATE_URL, params=params, headers=headers)
+                if resp.status_code != 200:
+                    self.logger.debug("[Uber] API returned %d", resp.status_code)
+                    return []
+                data = resp.json()
+        except Exception as e:
+            self.logger.debug("[Uber] API request failed: %s", e)
+            return []
 
-        # ── Extract fare data ────────────────────────────────────────────────
+        return self._parse_api_response(data, od, run_id)
+
+    def _parse_api_response(self, data: dict, od: Dict, run_id: str) -> List[Dict]:
         records = []
-        page_text = await page.inner_text("body")
-        surge_info = detect_surge(page_text)
+        # Uber's response shape varies — try multiple paths
+        products = (
+            data.get("products") or
+            data.get("data", {}).get("products") or
+            data.get("prices") or
+            data.get("data", {}).get("prices") or
+            []
+        )
 
-        # Try to get individual service cards
-        cards = await page.locator('[class*="PriceEstimateCard" i], [class*="fare-card" i], [class*="product-card" i]').all()
+        if not products:
+            return []
 
-        if cards:
-            for card in cards:
-                try:
-                    card_text = await card.inner_text()
-                    service = await self._extract_service_name(card)
-                    price = await self._extract_price(card)
-                    eta = await self._extract_eta(card)
-                    records.append(build_record(
-                        platform=self.platform_key,
-                        od=od,
-                        service_name=service or "Unknown",
-                        price_raw=price,
-                        run_id=run_id,
-                        eta_minutes=eta,
-                        surge=detect_surge(card_text),
-                    ))
-                except Exception as e:
-                    self.logger.debug("Card parse error: %s", e)
-        else:
-            # Fallback: parse entire page text with regex
-            records = self._parse_page_text_fallback(page_text, od, run_id, surge_info)
+        for p in products:
+            name = (
+                p.get("display_name") or
+                p.get("name") or
+                p.get("localized_display_name", "Unknown")
+            )
+            # Price range
+            low  = p.get("low_estimate") or p.get("estimate") or p.get("price_details", {}).get("minimum")
+            high = p.get("high_estimate") or p.get("price_details", {}).get("base")
+            currency_code = p.get("currency_code", "INR")
 
-        self.logger.info("[Uber] %s → got %d service records", od["label"], len(records))
+            if low:
+                price_raw = f"₹{int(low)}" + (f" - ₹{int(high)}" if high and high != low else "")
+            else:
+                price_raw = p.get("estimate")  # sometimes a string like "₹120-₹150"
+
+            eta = p.get("estimate") if isinstance(p.get("estimate"), int) else None
+            surge = p.get("surge_multiplier", 1.0)
+
+            records.append(build_record(
+                platform=self.platform_key,
+                od=od,
+                service_name=name,
+                price_raw=price_raw,
+                run_id=run_id,
+                eta_minutes=p.get("duration"),
+                surge={"surge_active": int(surge > 1), "surge_mult": surge if surge > 1 else None},
+            ))
+
         return records
 
-    async def _extract_service_name(self, card) -> str:
-        for sel in ['[class*="product-name" i]', '[class*="ProductName" i]', 'h3', 'h4', 'strong']:
-            el = card.locator(sel).first
-            if await el.count():
-                return (await el.inner_text()).strip()
-        return "Unknown"
+    async def _intercept_scrape(self, page: Page, od: Dict, run_id: str) -> List[Dict]:
+        """Open Uber's web page and intercept the API call it makes internally."""
+        intercepted = []
 
-    async def _extract_price(self, card) -> str:
-        for sel in ['[class*="price" i]', '[class*="fare" i]', '[class*="Price" i]']:
-            el = card.locator(sel).first
-            if await el.count():
-                text = (await el.inner_text()).strip()
-                if re.search(r"[\d₹]", text):
-                    return text
-        # Last resort: find ₹ pattern in card text
-        text = await card.inner_text()
-        m = re.search(r"₹[\d,]+(?:\s*[-–]\s*₹?[\d,]+)?", text)
-        return m.group(0) if m else None
+        async def handle_response(response: Response):
+            url = response.url
+            if any(k in url for k in ["product-estimates", "price-estimate", "fare", "estimate"]):
+                try:
+                    body = await response.json()
+                    intercepted.append(body)
+                except Exception:
+                    pass
 
-    async def _extract_eta(self, card) -> int:
-        text = await card.inner_text()
-        m = re.search(r"(\d+)\s*min", text, re.IGNORECASE)
-        return int(m.group(1)) if m else None
+        page.on("response", handle_response)
 
-    def _parse_page_text_fallback(self, text: str, od: Dict, run_id: str, surge_info: Dict) -> List[Dict]:
-        """Crude regex fallback when DOM selectors don't match."""
+        try:
+            # Navigate directly with lat/lng in URL — Uber supports this
+            url = (
+                f"{self.WEB_URL}"
+                f"?pickup_latitude={od['origin']['lat']}"
+                f"&pickup_longitude={od['origin']['lng']}"
+                f"&dropoff_latitude={od['destination']['lat']}"
+                f"&dropoff_longitude={od['destination']['lng']}"
+            )
+            await page.goto(url, wait_until="domcontentloaded")
+            await asyncio.sleep(6)  # Wait for API calls to fire
+
+        except Exception as e:
+            self.logger.debug("[Uber] Page navigation failed: %s", e)
+
+        for resp_data in intercepted:
+            records = self._parse_api_response(resp_data, od, run_id)
+            if records:
+                return records
+
+        # Final fallback: parse whatever text is on the page
+        try:
+            page_text = await page.inner_text("body")
+            return self._parse_text(page_text, od, run_id)
+        except Exception:
+            return []
+
+    def _parse_text(self, text: str, od: Dict, run_id: str) -> List[Dict]:
         records = []
-        patterns = [
-            (r"(UberGo|UberX|Premier|Uber XL|Uber Auto|Uber Moto|UberPool).*?(₹[\d,]+(?:\s*[-–]\s*₹?[\d,]+)?)", re.IGNORECASE),
-        ]
-        for pat, flags in patterns:
-            for m in re.finditer(pat, text, flags):
-                records.append(build_record(
-                    platform=self.platform_key,
-                    od=od,
-                    service_name=m.group(1).strip(),
-                    price_raw=m.group(2).strip(),
-                    run_id=run_id,
-                    surge=surge_info,
-                ))
+        for m in re.finditer(
+            r"(UberGo|UberX|Uber Auto|Uber Moto|Premier|UberXL|Comfort)[^\n]*?(₹[\d,]+(?:\s*[-–]\s*₹?[\d,]+)?)",
+            text, re.IGNORECASE
+        ):
+            records.append(build_record(
+                platform=self.platform_key, od=od,
+                service_name=m.group(1), price_raw=m.group(2),
+                run_id=run_id, surge=detect_surge(text),
+            ))
         return records
